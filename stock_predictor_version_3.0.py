@@ -1,0 +1,511 @@
+# Import necessary libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import yfinance as yf
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, RandomizedSearchCV # New imports for time series CV and tuning
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+import datetime
+import ta # Technical analysis library
+import joblib
+import os
+import lightgbm as lgb # New import for LightGBM
+
+# --- Configuration ---
+# Define the stock ticker symbol you want to predict
+STOCK_TICKER = "AAPL" # Example: Apple Inc.
+# Define the start and end dates for historical data
+START_DATE = "2020-01-01"
+END_DATE = datetime.date.today().strftime("%Y-%m-%d") # Today's date
+# Number of days to look back for features (lag features)
+N_LAG_DAYS = 5
+# Number of days into the future to predict
+PREDICT_N_DAYS_FUTURE = 1
+# Choose your model: 'LinearRegression', 'RandomForestRegressor', or 'LGBMRegressor'
+MODEL_CHOICE = 'LGBMRegressor' # Changed to LightGBM for advanced features
+
+# Max window for MACD, which is often the largest. Default slow period is 26.
+# Adding 20 for Bollinger Bands/Chaikin Money Flow.
+MAX_INDICATOR_CALCULATION_WINDOW = max(26, 20, 14) # Max window from MACD, BB, RSI, ATR, Stoch, CMF, etc.
+
+# File paths for saving/loading the model, scaler, and feature columns
+MODEL_FILE = f'{STOCK_TICKER}_stock_prediction_model_{MODEL_CHOICE.lower()}.joblib'
+SCALER_FILE = f'{STOCK_TICKER}_scaler_{MODEL_CHOICE.lower()}.joblib'
+FEATURE_COLUMNS_FILE = f'{STOCK_TICKER}_feature_columns_{MODEL_CHOICE.lower()}.joblib'
+
+# --- Data Collection Function ---
+def fetch_stock_data(ticker, start, end):
+    """
+    Fetches historical stock data from Yahoo Finance.
+
+    Args:
+        ticker (str): The stock ticker symbol (e.g., "AAPL").
+        start (str): The start date in "YYYY-MM-DD" format.
+        end (str): The end date in "YYYY-MM-DD" format.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing historical stock data,
+                      or None if data fetching fails.
+    """
+    print(f"Fetching historical data for {ticker} from {start} to {end}...")
+    try:
+        # Set auto_adjust=False to get original 'Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close'
+        # This prevents yfinance from modifying 'Close' and removing 'Adj Close'.
+        data = yf.download(ticker, start=start, end=end, auto_adjust=False)
+        if data.empty:
+            print(f"No data found for {ticker} in the specified range. Please check ticker or date range.")
+            return None
+        print("Data fetched successfully.")
+
+        # Print initial columns for debugging
+        print(f"Initial columns after yfinance download: {data.columns.tolist()}")
+
+        # --- BUG FIX: Reliably flatten MultiIndex columns ---
+        # For a single ticker with auto_adjust=False, yfinance often returns columns
+        # as a MultiIndex like [('Close', 'AAPL'), ('High', 'AAPL'), ...]
+        if isinstance(data.columns, pd.MultiIndex):
+            # Dropping level 1 (the ticker symbol 'AAPL') will leave just 'Close', 'High', etc.
+            data.columns = data.columns.droplevel(1)
+        
+        # Explicitly rename standard Yahoo Finance columns to consistent names
+        # This handles cases where 'Adj Close' might have a space, etc., and ensures consistency.
+        data = data.rename(columns={
+            'Adj Close': 'Adj_Close', # Standardized name
+            'Open': 'Open',
+            'High': 'High',
+            'Low': 'Low',
+            'Close': 'Close',
+            'Volume': 'Volume'
+        })
+
+        # Further clean any remaining non-standard characters from column names
+        # This ensures LightGBM compatibility.
+        data.columns = [
+            col.replace(' ', '_').replace('.', '_').replace('[', '').replace(']', '').replace('<', '').replace('>', '').replace(',', '')
+            for col in data.columns
+        ]
+        
+        # Ensure 'Close' and other critical columns exist after renaming/cleaning
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj_Close']
+        for col in required_cols:
+            if col not in data.columns:
+                print(f"Error: Required column '{col}' not found in fetched data after processing. Available columns: {data.columns.tolist()}")
+                return None
+
+        print(f"Final columns after processing: {data.columns.tolist()}")
+        return data
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
+        return None
+
+# --- Feature Engineering Function ---
+def add_features(df, lag_days):
+    """
+    Adds daily returns, technical indicators, and lag features to the DataFrame.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame with historical stock data.
+        lag_days (int): Number of previous days' 'Close' prices to use as features.
+
+    Returns:
+        pd.DataFrame: DataFrame with added features.
+    """
+    df_with_features = df.copy()
+
+    # Daily Returns
+    df_with_features['Daily_Return'] = df_with_features['Close'].pct_change()
+
+    # Ensure 'Close', 'High', 'Low' are numeric, 1-dimensional Series for ta calculations
+    close_series = df_with_features['Close'].astype(float).squeeze()
+    high_series = df_with_features['High'].astype(float).squeeze()
+    low_series = df_with_features['Low'].astype(float).squeeze()
+    volume_series = df_with_features['Volume'].astype(float).squeeze()
+
+    # Simple Moving Averages
+    df_with_features['SMA_10'] = ta.trend.sma_indicator(close=close_series, window=10, fillna=False)
+    df_with_features['SMA_20'] = ta.trend.sma_indicator(close=close_series, window=20, fillna=False)
+
+    # Relative Strength Index (RSI)
+    df_with_features['RSI'] = ta.momentum.rsi(close=close_series, window=14, fillna=False)
+
+    # Moving Average Convergence Divergence (MACD)
+    df_with_features['MACD'] = ta.trend.macd(close=close_series, fillna=False)
+
+    # Bollinger Bands
+    df_with_features['BB_High'] = ta.volatility.bollinger_hband(close=close_series, fillna=False)
+    df_with_features['BB_Low'] = ta.volatility.bollinger_lband(close=close_series, fillna=False)
+    
+    # NEW: Bollinger Band Width and %B
+    df_with_features['BB_Width'] = ta.volatility.bollinger_wband(close=close_series, window=20, fillna=False)
+    df_with_features['BB_Percent_B'] = ta.volatility.bollinger_pband(close=close_series, window=20, fillna=False)
+
+    # New Advanced Indicators
+    # Average True Range (ATR)
+    df_with_features['ATR'] = ta.volatility.average_true_range(high=high_series, low=low_series, close=close_series, window=14, fillna=False)
+    # On-Balance Volume (OBV)
+    df_with_features['OBV'] = ta.volume.on_balance_volume(close=close_series, volume=volume_series, fillna=False)
+
+    # NEW: Stochastic Oscillator
+    df_with_features['Stoch_K'] = ta.momentum.stoch(high=high_series, low=low_series, close=close_series, window=14, fillna=False)
+    df_with_features['Stoch_D'] = ta.momentum.stoch_signal(high=high_series, low=low_series, close=close_series, window=3, fillna=False) # Corrected parameter name
+
+    # NEW: Rate of Change (ROC)
+    df_with_features['ROC'] = ta.momentum.roc(close=close_series, window=12, fillna=False)
+
+    # NEW: Chaikin Money Flow (CMF)
+    df_with_features['CMF'] = ta.volume.chaikin_money_flow(high=high_series, low=low_series, close=close_series, volume=volume_series, window=20, fillna=False)
+
+    # NEW: Rolling Volatility (Standard Deviation of Daily Returns)
+    df_with_features['Rolling_Vol_20'] = df_with_features['Daily_Return'].rolling(window=20).std()
+
+    # NEW: Price-Volume Trend (PVT)
+    # PVT = Previous PVT + ((Close - Previous Close) / Previous Close) * Volume
+    # Needs custom calculation as ta.volume.pvt() might not handle initial NaNs well or match logic
+    df_with_features['PVT'] = (close_series.diff() / close_series.shift(1)) * volume_series
+    df_with_features['PVT'] = df_with_features['PVT'].cumsum().fillna(0) # Cumsum and fillna for initial values
+
+
+    # NEW: Temporal Features (Day of Week, Month, Quarter, Week of Year)
+    # Ensure index is datetime for these operations
+    if not isinstance(df_with_features.index, pd.DatetimeIndex):
+        df_with_features.index = pd.to_datetime(df_with_features.index)
+
+    df_with_features['Day_Of_Week'] = df_with_features.index.dayofweek # Monday=0, Sunday=6
+    df_with_features['Day_Of_Month'] = df_with_features.index.day
+    df_with_features['Week_Of_Year'] = df_with_features.index.isocalendar().week.astype(int)
+    df_with_features['Month_Of_Year'] = df_with_features.index.month
+    df_with_features['Quarter_Of_Year'] = df_with_features.index.quarter
+
+
+    # Create Lag Features for all relevant columns
+    feature_cols_to_lag = [
+        'Close', 'Volume', 'Open', 'High', 'Low',
+        'Daily_Return', 'SMA_10', 'SMA_20', 'RSI', 'MACD', 'BB_High', 'BB_Low',
+        'ATR', 'OBV',
+        'BB_Width', 'BB_Percent_B', 'Stoch_K', 'Stoch_D', 'ROC', 'CMF',
+        'Rolling_Vol_20', 'PVT', # Added new indicators to lag
+        'Day_Of_Week', 'Day_Of_Month', 'Week_Of_Year', 'Month_Of_Year', 'Quarter_Of_Year' # Added temporal features to lag
+    ]
+
+    for col in feature_cols_to_lag:
+        for i in range(1, lag_days + 1):
+            df_with_features[f'{col}_Lag_{i}'] = df_with_features[col].shift(i)
+    
+    return df_with_features
+
+# --- Data Preparation Function ---
+def prepare_data(df, lag_days, predict_future_days):
+    """
+    Prepares the DataFrame by creating various features and the target variable.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame with historical stock data.
+        lag_days (int): Number of previous days' 'Close' prices to use as features.
+        predict_future_days (int): Number of days into the future to predict.
+
+    Returns:
+        tuple: A tuple containing:
+               - pd.DataFrame: Scaled Features (X_scaled).
+               - pd.Series: Target variable (y).
+               - pd.DataFrame: The original DataFrame with added features and target.
+               - sklearn.preprocessing.StandardScaler: The fitted scaler object.
+               - list: Names of the features columns used (X.columns.tolist()).
+    """
+    # Add features to the dataframe
+    df_with_features = add_features(df, lag_days)
+
+    # Create the target variable (future 'Close' price)
+    df_with_features['Target'] = df_with_features['Close'].shift(-predict_future_days)
+
+    # Drop rows with NaN values introduced by shifting and indicator calculations
+    initial_rows = len(df_with_features)
+    df_with_features.dropna(inplace=True)
+    if len(df_with_features) == 0:
+        print(f"Warning: After feature engineering and dropping NaNs, no data remains. Original rows: {initial_rows}")
+        return pd.DataFrame(), pd.Series(), pd.DataFrame(), None, []
+
+
+    # Select features (X) and target (y)
+    features_list = [col for col in df_with_features.columns if col not in ['Target', 'Adj_Close']] # Changed 'Adj Close' to 'Adj_Close'
+    X = df_with_features[features_list]
+    y = df_with_features['Target']
+
+    # Feature Scaling
+    print("Scaling features...")
+    scaler = StandardScaler()
+    # Fit the scaler on the features and transform them
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+    print("Features scaled successfully.")
+
+    print(f"Data prepared with {len(features_list)} features (including technical indicators and lags) and '{predict_future_days}'-day future target.")
+    print(f"First 5 rows of scaled features (X_scaled):\n{X_scaled.head()}")
+    print(f"First 5 rows of target (y):\n{y.head()}")
+    return X_scaled, y, df_with_features, scaler, X.columns.tolist()
+
+# --- Model Training and Prediction Function ---
+def train_and_predict(X_scaled, y, model_choice):
+    """
+    Trains a selected machine learning model and makes predictions.
+    Includes TimeSeriesSplit for CV and RandomizedSearchCV for tuning if LGBM.
+
+    Args:
+        X_scaled (pd.DataFrame): Scaled Features.
+        y (pd.Series): Target variable.
+        model_choice (str): Name of the model to use ('LinearRegression', 'RandomForestRegressor', 'LGBMRegressor').
+
+    Returns:
+        tuple: A tuple containing:
+               - sklearn.base.Estimator: The trained model.
+               - np.ndarray: Training set predictions.
+               - np.ndarray: Test set predictions.
+               - pd.DataFrame: X_train (features for training).
+               - pd.DataFrame: X_test (features for testing).
+               - pd.Series: y_train (target for training).
+               - pd.Series: y_test (target for testing).
+    """
+    # Split the data into training and testing sets
+    # Using shuffle=False to maintain time series order
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42, shuffle=False)
+
+    print(f"Data split: Training size={len(X_train)}, Testing size={len(X_test)}")
+
+    model = None
+    if model_choice == 'LinearRegression':
+        model = LinearRegression()
+        print("Using Linear Regression model.")
+    elif model_choice == 'RandomForestRegressor':
+        model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        print("Using RandomForestRegressor model.")
+    elif model_choice == 'LGBMRegressor':
+        print("Using LGBMRegressor model with RandomizedSearchCV for tuning...")
+        # Define the parameter distribution for RandomizedSearchCV
+        param_dist = {
+            'n_estimators': [100, 200, 300, 500],
+            'learning_rate': [0.01, 0.05, 0.1, 0.2],
+            'num_leaves': [20, 31, 40, 50],
+            'max_depth': [-1, 5, 8, 10], # -1 means no limit
+            'min_child_samples': [20, 30, 50],
+            'subsample': [0.7, 0.8, 0.9, 1.0],
+            'colsample_bytree': [0.7, 0.8, 0.9, 1.0],
+            'reg_alpha': [0, 0.1, 0.5, 1.0], # L1 regularization
+            'reg_lambda': [0, 0.1, 0.5, 1.0], # L2 regularization
+        }
+
+        lgbm = lgb.LGBMRegressor(random_state=42, n_jobs=-1, verbose=-1) # verbose=-1 suppresses output
+        
+        # TimeSeriesSplit for cross-validation
+        # n_splits determines the number of train/test splits.
+        # Max_train_size limits the size of the training set in each split, useful for large datasets.
+        # gap ensures a gap between training and validation set, reflecting real-world scenarios.
+        tscv = TimeSeriesSplit(n_splits=5) # 5 splits
+
+        # RandomizedSearchCV
+        random_search = RandomizedSearchCV(
+            estimator=lgbm,
+            param_distributions=param_dist,
+            n_iter=50, # Number of parameter settings that are sampled. Reduce for faster runs.
+            scoring='neg_mean_squared_error', # Using negative MSE, as GridSearchCV maximizes score
+            cv=tscv,
+            verbose=1,
+            random_state=42,
+            n_jobs=-1 # Use all available cores
+        )
+
+        random_search.fit(X_train, y_train)
+        model = random_search.best_estimator_
+        print(f"Best parameters found: {random_search.best_params_}")
+        print(f"Best RMSE found during CV: {np.sqrt(-random_search.best_score_):.2f}")
+    else:
+        raise ValueError("Invalid MODEL_CHOICE. Choose 'LinearRegression', 'RandomForestRegressor', or 'LGBMRegressor'.")
+
+    # In case of GridSearchCV/RandomizedSearchCV, the best estimator is already fitted.
+    # We only call fit here if we are not using RandomizedSearchCV or to ensure it's fully fitted
+    # if the best_estimator_ from search itself isn't directly usable for subsequent predictions
+    # without an explicit fit (which it usually is). For simplicity, keep it.
+    model.fit(X_train, y_train) # Fit the best model (or the chosen model if not LGBM)
+    print("Model trained successfully.")
+
+    # Feature Importance (for tree-based models)
+    if hasattr(model, 'feature_importances_'):
+        feature_importances = pd.Series(model.feature_importances_, index=X_train.columns)
+        print("\n--- Feature Importances ---")
+        print(feature_importances.nlargest(10)) # Print top 10 most important features
+        print("---------------------------\n")
+
+    # Make predictions on the training and test sets
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+
+    # Evaluate the model
+    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+
+    print(f"\n--- Model Performance ({model_choice}) ---")
+    print(f"Training RMSE: {train_rmse:.2f}")
+    print(f"Test RMSE: {test_rmse:.2f}") # Corrected this line to print test_rmse
+    print(f"Training R-squared: {train_r2:.2f}")
+    print(f"Test R-squared: {test_r2:.2f}")
+    print("-------------------------\n")
+
+    return model, y_train_pred, y_test_pred, X_train, X_test, y_train, y_test
+
+# --- Visualization Function ---
+def visualize_predictions(original_df, y_train, y_test, y_train_pred, y_test_pred, predict_future_days):
+    """
+    Visualizes the actual and predicted stock prices.
+
+    Args:
+        original_df (pd.DataFrame): The DataFrame with features and target, after dropna.
+        y_train (pd.Series): Actual target values for the training set.
+        y_test (pd.Series): Actual target values for the test set.
+        y_train_pred (np.ndarray): Predicted values for the training set.
+        y_test_pred (np.ndarray): Predicted values for the test set.
+        predict_future_days (int): Number of days into the future predicted.
+    """
+    plt.figure(figsize=(14, 7))
+
+    all_predictions = np.concatenate((y_train_pred, y_test_pred))
+    prediction_dates = original_df.index[-len(all_predictions):]
+
+    plt.plot(original_df.index[-len(y_test) - len(y_train):],
+             pd.concat([y_train, y_test]),
+             label='Actual Future Close Price', color='blue', linewidth=2)
+
+    plt.plot(prediction_dates,
+             all_predictions,
+             label='Model Predictions', color='red', linestyle='--', alpha=0.7)
+
+
+    plt.title(f'{STOCK_TICKER} Stock Price Prediction ({predict_future_days}-day future price) using {MODEL_CHOICE}')
+    plt.xlabel('Date')
+    plt.ylabel('Close Price')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    trained_model = None
+    fitted_scaler = None
+    feature_columns_loaded = [] # To store the feature columns from training
+
+    # Adjust file paths based on MODEL_CHOICE for proper persistence
+    MODEL_FILE = f'{STOCK_TICKER}_stock_prediction_model_{MODEL_CHOICE.lower()}.joblib'
+    SCALER_FILE = f'{STOCK_TICKER}_scaler_{MODEL_CHOICE.lower()}.joblib'
+    FEATURE_COLUMNS_FILE = f'{STOCK_TICKER}_feature_columns_{MODEL_CHOICE.lower()}.joblib'
+
+    # Option to load existing model, scaler, and feature columns
+    if os.path.exists(MODEL_FILE) and os.path.exists(SCALER_FILE) and os.path.exists(FEATURE_COLUMNS_FILE):
+        print(f"Loading existing model from {MODEL_FILE}, scaler from {SCALER_FILE}, and feature columns from {FEATURE_COLUMNS_FILE}...")
+        try:
+            trained_model = joblib.load(MODEL_FILE)
+            fitted_scaler = joblib.load(SCALER_FILE)
+            feature_columns_loaded = joblib.load(FEATURE_COLUMNS_FILE)
+            print("Model, scaler, and feature columns loaded successfully. Skipping retraining.")
+        except Exception as e:
+            print(f"Error loading saved files: {e}. Proceeding with fresh training.")
+            trained_model = None # Reset to trigger retraining
+    else:
+        print("No existing model, scaler, or feature columns found. Proceeding with data fetching and training.")
+    
+    # If model was not loaded (either not found or error during loading), proceed with training
+    if trained_model is None:
+        # 1. Fetch Data
+        stock_df = fetch_stock_data(STOCK_TICKER, START_DATE, END_DATE)
+
+        if stock_df is not None:
+            # 2. Prepare Data (calculate features, lags, and scale)
+            X_scaled, y, processed_df, fitted_scaler, feature_columns_for_saving = prepare_data(stock_df, N_LAG_DAYS, PREDICT_N_DAYS_FUTURE)
+
+            # 3. Train and Predict
+            if not X_scaled.empty and not y.empty:
+                trained_model, y_train_pred, y_test_pred, X_train, X_test, y_train, y_test = train_and_predict(X_scaled, y, MODEL_CHOICE)
+
+                # Save the trained model, scaler, and feature columns
+                print(f"Saving trained model to {MODEL_FILE}, scaler to {SCALER_FILE}, and feature columns to {FEATURE_COLUMNS_FILE}...")
+                joblib.dump(trained_model, MODEL_FILE)
+                joblib.dump(fitted_scaler, SCALER_FILE)
+                joblib.dump(feature_columns_for_saving, FEATURE_COLUMNS_FILE)
+                print("Model, scaler, and feature columns saved.")
+
+                # 4. Visualize Results (only if training happened)
+                visualize_predictions(processed_df, y_train, y_test, y_train_pred, y_test_pred, PREDICT_N_DAYS_FUTURE)
+                # Set loaded feature columns for future predictions
+                feature_columns_loaded = feature_columns_for_saving
+            else:
+                print("Data preparation resulted in empty features or target. Cannot train model.")
+                exit() # Exit if no data to train
+
+        else:
+            print("Failed to fetch stock data. Exiting.")
+            exit() # Exit if no data
+
+    # --- Predict the next 'PREDICT_N_DAYS_FUTURE' days (works with loaded or newly trained model) ---
+    if trained_model is not None and fitted_scaler is not None and feature_columns_loaded:
+        print(f"\n--- Predicting {PREDICT_N_DAYS_FUTURE} day(s) into the future ---")
+        try:
+            # Always fetch fresh data for prediction to ensure we have the very latest
+            latest_stock_df = fetch_stock_data(STOCK_TICKER, START_DATE, END_DATE)
+            if latest_stock_df is None:
+                print("Could not fetch latest stock data for future prediction.")
+                exit()
+
+            # Determine the maximum historical window required for indicators and lags.
+            # Updated to include window for Rolling_Vol_20 (20) and a buffer for PVT.
+            # Temporal features don't add to window size, but need datetime index.
+            max_indicator_window = max(10, 20, 14, MAX_INDICATOR_CALCULATION_WINDOW)
+            
+            # The number of raw data points needed to ensure at least one complete row
+            # after all indicators are calculated AND all lags are applied.
+            # It's (max_indicator_window - 1) NaNs from indicators + N_LAG_DAYS NaNs from lags + 1 (for the valid row itself)
+            # Adding a small buffer for extra robustness against missing days or partial data
+            required_raw_data_points = (max_indicator_window - 1) + N_LAG_DAYS + 1 + 2 # Added a buffer of 2 days
+
+
+            if len(latest_stock_df) < required_raw_data_points:
+                 print(f"Not enough historical data ({len(latest_stock_df)} rows) to compute all features for future prediction and lags. Need at least {required_raw_data_points} rows for current indicators and lags to be fully formed for the last prediction point.")
+                 exit()
+
+            # Take a sufficient slice of the latest_stock_df to calculate all necessary features
+            # for the very last known date, including enough history for indicators and lags.
+            data_for_prediction_features_raw = latest_stock_df.iloc[-required_raw_data_points:].copy()
+
+            # Apply the same feature engineering function used for training data
+            engineered_features_for_pred = add_features(data_for_prediction_features_raw, N_LAG_DAYS)
+
+            # Drop any NaNs that might appear at the start of this small slice due to lag/indicator calculations
+            engineered_features_for_pred.dropna(inplace=True)
+
+            if not engineered_features_for_pred.empty:
+                # The last row of this specifically engineered slice contains the features
+                # needed to predict the next future point.
+                # Create a DataFrame with the exact column names the model was trained on
+                next_day_features_df = pd.DataFrame(
+                    engineered_features_for_pred.iloc[-1][feature_columns_loaded].values.reshape(1, -1),
+                    columns=feature_columns_loaded # Assign feature names here
+                )
+
+                # Scale these new features using the *fitted scaler*
+                # StandardScaler expects a DataFrame or array-like, so passing the DataFrame is fine.
+                next_day_features_scaled = fitted_scaler.transform(next_day_features_df)
+                next_future_price_pred = trained_model.predict(next_day_features_scaled)
+
+                last_known_date = latest_stock_df.index[-1]
+                prediction_date = last_known_date + pd.Timedelta(days=PREDICT_N_DAYS_FUTURE)
+
+                print(f"Predicted {STOCK_TICKER} close price for {prediction_date.strftime('%Y-%m-%d')} ({PREDICT_N_DAYS_FUTURE} day(s) from last known data): ${next_future_price_pred[0]:.2f}")
+            else:
+                print("Not enough data to form the feature vector for future prediction even after subsetting and engineering.")
+                print("This might happen if the fetched data period is too short for indicator calculation or lags.")
+
+        except Exception as e:
+            print(f"Could not predict next future price: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("Model, scaler, or feature columns not available for prediction. Please ensure training completed successfully or files exist.")
