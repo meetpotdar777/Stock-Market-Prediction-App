@@ -1,6 +1,7 @@
 {
     "cSpell.words": [
         "actuals",
+        "autofmt",
         "Bokeh",
         "bollinger",
         "bytree",
@@ -11,6 +12,7 @@
         "dropna",
         "FEDFUNDS",
         "figsize",
+        "fontsize",
         "fredapi",
         "hband",
         "importances",
@@ -35,9 +37,12 @@
         "Stoch",
         "Streamlit",
         "subsetting",
+        "textcoords",
         "tscv",
         "wband",
+        "xdate",
         "xlabel",
+        "xytext",
         "yfinance",
         "ylabel"
     ]
