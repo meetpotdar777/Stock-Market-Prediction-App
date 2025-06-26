@@ -1,5 +1,6 @@
 {
     "cSpell.words": [
+        "actuals",
         "Bokeh",
         "bollinger",
         "bytree",
@@ -20,9 +21,11 @@
         "lightgbm",
         "linestyle",
         "MACD",
+        "markersize",
         "matplotlib",
         "ndarray",
         "numpy",
+        "OHLCV",
         "pband",
         "Plotly",
         "predictior",
