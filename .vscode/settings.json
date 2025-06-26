@@ -2,14 +2,22 @@
     "cSpell.words": [
         "bollinger",
         "bytree",
+        "Chaikin",
         "colsample",
         "figsize",
         "hband",
         "importances",
         "lband",
         "LGBM",
+        "linestyle",
         "MACD",
         "ndarray",
-        "tscv"
+        "pband",
+        "Stoch",
+        "subsetting",
+        "tscv",
+        "wband",
+        "xlabel",
+        "ylabel"
     ]
 }
