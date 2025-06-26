@@ -1,10 +1,15 @@
 {
     "cSpell.words": [
         "bollinger",
+        "bytree",
         "colsample",
+        "figsize",
+        "hband",
+        "importances",
         "lband",
         "LGBM",
         "MACD",
-        "ndarray"
+        "ndarray",
+        "tscv"
     ]
 }
